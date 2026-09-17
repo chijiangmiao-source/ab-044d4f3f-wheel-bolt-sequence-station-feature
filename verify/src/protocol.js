@@ -48,6 +48,17 @@ async function postCancel(base, sid, reason) {
   return { status: r.status, body: await r.json() };
 }
 
+async function postRetract(base, sid, confirmationId) {
+  const r = await fetch(`${base}/api/sessions/${sid}/confirmations/last/retract`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(
+      confirmationId === undefined ? {} : { confirmation_id: confirmationId },
+    ),
+  });
+  return { status: r.status, body: await r.json() };
+}
+
 /** 以原始 JSON 文本提交（用于保真发送 42.00 等读数）。 */
 async function postConfRaw(base, sid, rawPayload) {
   const r = await fetch(`${base}/api/sessions/${sid}/confirmations`, {
@@ -67,6 +78,19 @@ async function confirmSteps(base, sid, n) {
       idempotency_key: key(`step${i + 1}`),
     });
     assertEqual(r.status, 201, `第 ${i + 1} 步状态码`);
+  }
+}
+
+/** 确认从 fromSeq 到第 6 步的剩余步骤（用于撤回重做后续完成整轮）。 */
+async function confirmStepsFrom(base, sid, fromSeq) {
+  for (let seq = fromSeq; seq <= POSITIONS.length; seq += 1) {
+    const r = await postConf(base, sid, {
+      sequence: seq,
+      position: POSITIONS[seq - 1],
+      torque: 4500,
+      idempotency_key: key(`from${fromSeq}-step${seq}`),
+    });
+    assertEqual(r.status, 201, `第 ${seq} 步状态码`);
   }
 }
 
@@ -613,5 +637,318 @@ export async function runProtocol(base, t) {
     }
     const done = await getSession(base, s.session_id);
     assertEqual(done.status, 'completed', '旧会话六步后完成');
+  });
+
+  await t.test('撤回审计字段为新增字段：新会话返回空数组且不改变原有响应字段', async () => {
+    const s = await createSession(base);
+    assert(Array.isArray(s.retractions), '会话视图应包含 retractions 数组');
+    assertEqual(s.retractions.length, 0, '新会话无撤回记录');
+    assertEqual(s.expected_sequence, 1, '原有字段保持不变');
+    assertEqual(s.confirmations.length, 0, '原有确认列表保持不变');
+  });
+
+  await t.test('完成两步后撤回第二步、以新扭矩重做后可完成；刷新只见有效记录并保留审计', async () => {
+    const s = await createSession(base);
+    const c1 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4500, idempotency_key: key('retract-1'),
+    });
+    assertEqual(c1.status, 201, '第 1 步成功');
+    const c2 = await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4600, idempotency_key: key('retract-2-wrong'),
+    });
+    assertEqual(c2.status, 201, '第 2 步以错误扭矩 4600 落库');
+
+    // 撤回第二步
+    const r = await postRetract(base, s.session_id, c2.body.confirmation.id);
+    assertEqual(r.status, 200, '撤回状态码');
+    assertEqual(r.body.retracted, true, '返回撤回标记');
+    assertEqual(r.body.retraction.sequence, 2, '撤回事件序号为 2');
+    assertEqual(r.body.retraction.position, 'B2', '撤回事件位置为 B2');
+    assertEqual(r.body.retraction.torque, 4600, '撤回事件保留原错误读数');
+    assertEqual(r.body.retraction.confirmation_id, c2.body.confirmation.id, '撤回事件指向原确认');
+    assert(Boolean(r.body.retraction.retracted_at), '撤回事件携带撤回时间');
+    assertEqual(r.body.progress.status, 'in_progress', '撤回后仍为进行中');
+    assertEqual(r.body.progress.expected_sequence, 2, '权威进度回到第 2 颗');
+    assertEqual(r.body.progress.expected_position, 'B2', '权威进度位置回到 B2');
+    assertEqual(r.body.progress.confirmed_count, 1, '有效确认计数回退为 1');
+
+    // 撤回后立即以新扭矩（新的提交意图/新幂等键）重做第二步
+    const redo = await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4700, idempotency_key: key('retract-2-fixed'),
+    });
+    assertEqual(redo.status, 201, '同序号以新扭矩重新确认成功');
+    assertEqual(redo.body.confirmation.torque, 4700, '重做记录为新扭矩');
+    assertEqual(redo.body.progress.expected_sequence, 3, '重做后推进到第 3 步');
+
+    // 完成剩余四步
+    for (const [seq, pos] of [[3, 'A3'], [4, 'B1'], [5, 'A2'], [6, 'B3']]) {
+      const x = await postConf(base, s.session_id, {
+        sequence: seq, position: pos, torque: 4500, idempotency_key: key(`retract-rest-${seq}`),
+      });
+      assertEqual(x.status, 201, `重做后第 ${seq} 步成功`);
+    }
+
+    // 刷新：只显示重做后的有效记录，审计痕迹保留
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '撤回重做后整轮可完成');
+    assertEqual(st.confirmations.length, 6, '有效确认恰好六条');
+    assertEqual(st.confirmations[1].sequence, 2, '第 2 条有效记录序号为 2');
+    assertEqual(st.confirmations[1].torque, 4700, '第 2 条显示重做后的扭矩 4700');
+    assert(
+      !st.confirmations.some((c) => c.torque === 4600),
+      '被撤回的原读数 4600 不再计入 confirmations',
+    );
+    assertEqual(st.retractions.length, 1, '返回一条撤回审计');
+    assertEqual(st.retractions[0].torque, 4600, '审计保留被撤回的原读数 4600');
+    assertEqual(st.retractions[0].sequence, 2, '审计序号为 2');
+    assertEqual(st.retractions[0].position, 'B2', '审计位置为 B2');
+    assert(Boolean(st.retractions[0].confirmed_at), '审计保留原确认时间');
+    assert(Boolean(st.retractions[0].retracted_at), '审计保留撤回时间');
+    assertEqual(
+      st.retractions[0].confirmation_id,
+      c2.body.confirmation.id,
+      '审计指向被撤回的原确认',
+    );
+  });
+
+  await t.test('没有可撤回记录：409 nothing_to_retract 且进度不变', async () => {
+    const s = await createSession(base);
+    const r = await postRetract(base, s.session_id);
+    assertEqual(r.status, 409, '零确认撤回状态码');
+    assertEqual(r.body.error.code, 'nothing_to_retract', '无可撤回错误码');
+    assertEqual(r.body.progress.expected_sequence, 1, '错误附带权威进度');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.expected_sequence, 1, '期待序号不变');
+    assertEqual(st.confirmations.length, 0, '无确认记录');
+    assertEqual(st.retractions.length, 0, '无撤回记录');
+
+    // 撤回一颗后再把同序号撤回一次（无目标参数）也应明确拒绝
+    const c1 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4500, idempotency_key: key('retract-empty-1'),
+    });
+    const ok = await postRetract(base, s.session_id, c1.body.confirmation.id);
+    assertEqual(ok.status, 200, '撤回唯一确认成功');
+    const again = await postRetract(base, s.session_id);
+    assertEqual(again.status, 409, '再次撤回状态码');
+    assertEqual(again.body.error.code, 'nothing_to_retract', '已无可撤回记录');
+  });
+
+  await t.test('已完成会话不可撤回：409 session_completed 且完成态不变', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 6);
+    const done = await getSession(base, s.session_id);
+    const r = await postRetract(base, s.session_id, done.confirmations[5].id);
+    assertEqual(r.status, 409, '完成态撤回状态码');
+    assertEqual(r.body.error.code, 'session_completed', '完成态错误码');
+    assertEqual(r.body.progress.status, 'completed', '附带完成态进度');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '仍为完成态');
+    assertEqual(st.confirmations.length, 6, '六条有效确认不变');
+    assertEqual(st.retractions.length, 0, '不产生撤回事件');
+  });
+
+  await t.test('已终止会话不可撤回：409 session_cancelled', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 2);
+    await postCancel(base, s.session_id, '装夹错误');
+    const st0 = await getSession(base, s.session_id);
+    const r = await postRetract(base, s.session_id, st0.confirmations[1].id);
+    assertEqual(r.status, 409, '终止态撤回状态码');
+    assertEqual(r.body.error.code, 'session_cancelled', '终止态错误码');
+    assertEqual(r.body.progress.status, 'cancelled', '附带终止态进度');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'cancelled', '仍为终止态');
+    assertEqual(st.retractions.length, 0, '不产生撤回事件');
+  });
+
+  await t.test('两个撤回请求竞争：只成功一次，另一请求收到明确原因且进度只回退一次', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 2);
+    const st0 = await getSession(base, s.session_id);
+    const target = st0.confirmations[1].id;
+    const results = await Promise.all([
+      postRetract(base, s.session_id, target),
+      postRetract(base, s.session_id, target),
+    ]);
+    const statuses = results.map((r) => r.status).sort();
+    assertEqual(
+      JSON.stringify(statuses),
+      JSON.stringify([200, 409]),
+      '竞争结果应为一个 200 一个 409',
+    );
+    const ok = results.find((r) => r.status === 200);
+    const lost = results.find((r) => r.status === 409);
+    assertEqual(ok.body.retraction.confirmation_id, target, '成功者撤回目标确认');
+    assertEqual(lost.body.error.code, 'already_retracted', '竞争落败错误码');
+    assertEqual(lost.body.progress.expected_sequence, 2, '落败者收到回退后的权威进度');
+
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.retractions.length, 1, '只追加一条撤回事件');
+    assertEqual(st.expected_sequence, 2, '期待序号只回退一次');
+    assertEqual(st.confirmations.length, 1, '只剩第一条有效确认');
+    assertEqual(st.confirmations[0].sequence, 1, '剩余有效确认为第 1 步');
+  });
+
+  await t.test('可连续撤回多颗并逐颗重做，历史中同序号存在多条记录但任一时刻只有一条有效', async () => {
+    const s = await createSession(base);
+    const c1 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4500, idempotency_key: key('multi-r1'),
+    });
+    const c2 = await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4600, idempotency_key: key('multi-r2'),
+    });
+    const c3 = await postConf(base, s.session_id, {
+      sequence: 3, position: 'A3', torque: 4700, idempotency_key: key('multi-r3'),
+    });
+    const r3 = await postRetract(base, s.session_id, c3.body.confirmation.id);
+    assertEqual(r3.status, 200, '撤回第 3 步');
+    assertEqual(r3.body.progress.expected_sequence, 3, '回到第 3 步');
+    const r2 = await postRetract(base, s.session_id, c2.body.confirmation.id);
+    assertEqual(r2.status, 200, '再撤回第 2 步');
+    assertEqual(r2.body.progress.expected_sequence, 2, '回到第 2 步');
+
+    const mid = await getSession(base, s.session_id);
+    assertEqual(mid.confirmations.length, 1, '只剩一条有效确认');
+    assertEqual(mid.retractions.length, 2, '两条撤回审计');
+
+    await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4200, idempotency_key: key('multi-r2-fix'),
+    });
+    await postConf(base, s.session_id, {
+      sequence: 3, position: 'A3', torque: 4800, idempotency_key: key('multi-r3-fix'),
+    });
+    await confirmStepsFrom(base, s.session_id, 4);
+
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.status, 'completed', '连续撤回重做后完成');
+    assertEqual(st.confirmations.length, 6, '六条有效记录');
+    assertEqual(st.confirmations[1].torque, 4200, '第 2 步为重做值');
+    assertEqual(st.confirmations[2].torque, 4800, '第 3 步为重做值');
+    assertEqual(st.retractions.length, 2, '两条审计痕迹保留');
+
+    // 数据库层：序号 2、3 在历史上各有两条记录（一条已撤回、一条有效），
+    // 有效集合中每个序号仍只有一条。
+    const client = new pg.Client({
+      connectionString: process.env.DATABASE_URL || 'postgres://hub:hub@db:5432/hub_review',
+    });
+    await client.connect();
+    try {
+      const { rows: history } = await client.query(
+        `SELECT sequence,
+                count(*)::int AS total,
+                count(*) FILTER (WHERE retraction_id IS NULL)::int AS active
+         FROM confirmations WHERE session_id = $1
+         GROUP BY sequence HAVING count(*) > 1
+         ORDER BY sequence`,
+        [s.session_id],
+      );
+      assertEqual(history.length, 2, '序号 2、3 各有历史重确认记录');
+      assert(history.every((row) => row.active === 1), '每个重确认序号只有一条有效记录');
+      const { rows: dupes } = await client.query(
+        `SELECT sequence, count(*)::int AS n FROM confirmations
+         WHERE session_id = $1 AND retraction_id IS NULL
+         GROUP BY sequence HAVING count(*) > 1`,
+        [s.session_id],
+      );
+      assertEqual(dupes.length, 0, '不存在同一序号两条有效记录');
+    } finally {
+      await client.end();
+    }
+  });
+
+  await t.test('撤回后幂等键语义不变：旧键重放返回已撤回的原事件、不推进；新键才允许重做', async () => {
+    const s = await createSession(base);
+    const oldKey = key('retract-idem');
+    const c1 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4600, idempotency_key: oldKey,
+    });
+    assertEqual(c1.status, 201);
+    const r = await postRetract(base, s.session_id, c1.body.confirmation.id);
+    assertEqual(r.status, 200, '撤回成功');
+
+    // 同一幂等键 + 完全相同载荷重放：仍返回原确认事件（标记已撤回），不重新落库、不推进
+    const replay = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4600, idempotency_key: oldKey,
+    });
+    assertEqual(replay.status, 200, '旧键重放状态码');
+    assertEqual(replay.body.replayed, true, '标记为重放');
+    assertEqual(replay.body.confirmation.id, c1.body.confirmation.id, '返回原确认事件');
+    assertEqual(replay.body.confirmation.retracted, true, '原确认标记为已撤回');
+    assertEqual(replay.body.progress.expected_sequence, 1, '重放不推进');
+
+    // 同一幂等键 + 不同载荷仍判冲突
+    const conflict = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4700, idempotency_key: oldKey,
+    });
+    assertEqual(conflict.status, 409, '旧键不同载荷冲突');
+    assertEqual(conflict.body.error.code, 'idempotency_conflict', '冲突错误码');
+
+    // 新的提交意图（新幂等键）+ 正确读数才能重做
+    const redo = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4500, idempotency_key: key('retract-idem-fix'),
+    });
+    assertEqual(redo.status, 201, '新键重做成功');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations[0].torque, 4500, '有效记录为新读数');
+    assertEqual(st.retractions.length, 1, '审计保留');
+  });
+
+  await t.test('撤回目标不是当前最后一步：409 retraction_target_stale 且不撤回', async () => {
+    const s = await createSession(base);
+    const c1 = await postConf(base, s.session_id, {
+      sequence: 1, position: 'A1', torque: 4500, idempotency_key: key('stale-1'),
+    });
+    await postConf(base, s.session_id, {
+      sequence: 2, position: 'B2', torque: 4500, idempotency_key: key('stale-2'),
+    });
+    const r = await postRetract(base, s.session_id, c1.body.confirmation.id);
+    assertEqual(r.status, 409, '非最后一步状态码');
+    assertEqual(r.body.error.code, 'retraction_target_stale', '目标过期错误码');
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.confirmations.length, 2, '不撤回任何记录');
+    assertEqual(st.retractions.length, 0, '不产生撤回事件');
+  });
+
+  await t.test('撤回事件只增不改：数据库层拒绝撤回事件的 UPDATE/DELETE 及确认字段篡改', async () => {
+    const s = await createSession(base);
+    await confirmSteps(base, s.session_id, 2);
+    const st0 = await getSession(base, s.session_id);
+    await postRetract(base, s.session_id, st0.confirmations[1].id);
+
+    const client = new pg.Client({
+      connectionString: process.env.DATABASE_URL || 'postgres://hub:hub@db:5432/hub_review',
+    });
+    await client.connect();
+    try {
+      await assertRejects(
+        () => client.query('UPDATE retractions SET sequence = 6'),
+        '撤回事件 UPDATE 应被拒绝',
+      );
+      await assertRejects(
+        () => client.query('DELETE FROM retractions'),
+        '撤回事件 DELETE 应被拒绝',
+      );
+      await assertRejects(
+        () => client.query('UPDATE confirmations SET torque = 4999 WHERE retraction_id IS NOT NULL'),
+        '篡改被撤回确认的扭矩应被拒绝',
+      );
+      await assertRejects(
+        () => client.query(`
+          UPDATE confirmations SET retraction_id = 999999, retracted_at = now()
+          WHERE retraction_id IS NULL`),
+        '伪造撤回标记应被拒绝',
+      );
+    } finally {
+      await client.end();
+    }
+    const st = await getSession(base, s.session_id);
+    assertEqual(st.retractions.length, 1, '撤回事件仍在');
+    assertEqual(st.confirmations[0].torque, 4500, '确认记录未被篡改');
+  });
+
+  await t.test('未知会话撤回返回 404', async () => {
+    const r = await postRetract(base, '00000000-0000-0000-0000-000000000000', 1);
+    assertEqual(r.status, 404);
+    assertEqual(r.body.error.code, 'session_not_found');
   });
 }

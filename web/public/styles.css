@@ -83,6 +83,32 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 }
 #btn-cancel-open:hover:not(:disabled) { background: var(--err-bg); }
 
+#btn-retract-open {
+  margin-left: 10px;
+  color: var(--cur);
+  border-color: var(--cur);
+  background: #fff;
+}
+#btn-retract-open:hover:not(:disabled) { background: var(--cur-bg); }
+
+.btn-warning {
+  background: var(--cur);
+  border-color: var(--cur);
+  color: #fff;
+}
+.btn-warning:hover:not(:disabled) { background: #7d5400; }
+
+.retract-panel {
+  margin-top: 14px;
+  padding: 16px 20px;
+  border: 1px solid var(--cur);
+  border-radius: 8px;
+  background: var(--cur-bg);
+}
+
+.retract-panel h2 { margin: 0 0 8px; font-size: 18px; color: var(--cur); }
+.retract-actions { display: flex; gap: 10px; }
+
 .btn-danger {
   background: var(--err);
   border-color: var(--err);
@@ -241,6 +267,17 @@ button:disabled { opacity: 0.55; cursor: not-allowed; }
 
 .cancelled h2 { margin: 0 0 12px; color: var(--err); font-size: 20px; }
 .cancelled p { margin: 6px 0; }
+
+.retractions {
+  margin-top: 18px;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f9fbfd;
+}
+
+.retractions h2 { margin: 0 0 6px; font-size: 18px; }
+.retractions .hint { margin: 0 0 10px; font-size: 13px; }
 
 #confirm-table {
   width: 100%;

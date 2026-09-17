@@ -47,6 +47,8 @@ const state = {
   busy: false, // 是否有提交在途（含自动重试）
   cancelFormOpen: false, // 是否打开了终止原因填写面板
   cancelling: false, // 终止请求是否在途
+  retractFormOpen: false, // 是否打开了撤回上一步确认面板
+  retracting: false, // 撤回请求是否在途
   opening: false, // 是否有「打开复核 / 开始会话」请求在途
   unit: DEFAULT_UNIT,
 };
@@ -94,6 +96,7 @@ function adoptSession(body, notice) {
   state.workOrderCode = body.work_order_code ?? null;
   state.view = body;
   state.cancelFormOpen = false;
+  state.retractFormOpen = false;
   localStorage.setItem(SESSION_KEY, state.sessionId);
   if (state.workOrderCode) {
     localStorage.setItem(WORK_ORDER_KEY, state.workOrderCode);
@@ -118,6 +121,7 @@ function backToEntry(notice) {
     state.workOrderCode = null;
     state.view = null;
     state.cancelFormOpen = false;
+    state.retractFormOpen = false;
     $('torque-input').value = '';
     $('workorder-input').value = '';
   }
@@ -320,11 +324,16 @@ async function submitConfirmation() {
         if (res.ok) {
           await refresh();
           $('torque-input').value = '';
-          showNotice(
-            body && body.replayed
-              ? `第 ${attempt.sequence} 步已确认（网络重试，服务端去重）`
-              : `第 ${attempt.sequence} 步确认成功`,
-          );
+          if (body && body.replayed && body.confirmation && body.confirmation.retracted) {
+            // 重放命中的原确认已被撤回：该重试不代表当前步骤有效，请重新录入
+            showNotice('该读数对应的确认已被撤回，请重新录入扭矩并确认');
+          } else {
+            showNotice(
+              body && body.replayed
+                ? `第 ${attempt.sequence} 步已确认（网络重试，服务端去重）`
+                : `第 ${attempt.sequence} 步确认成功`,
+            );
+          }
           return;
         }
         // 确定性拒绝：不重试，展示原因并以权威进度对齐
@@ -401,6 +410,74 @@ async function cancelSession() {
   }
 }
 
+/** 取当前权威进度中的最后一条有效确认（无则 null）。 */
+function lastActiveConfirmation() {
+  const list = (state.view && state.view.confirmations) || [];
+  return list.length ? list[list.length - 1] : null;
+}
+
+/** 打开/关闭「撤回上一步」二次确认面板。 */
+function setRetractForm(open) {
+  state.retractFormOpen = open;
+  if (open) {
+    showError('');
+    const last = lastActiveConfirmation();
+    if (last) {
+      $('retract-detail').textContent =
+        `将撤回第 ${last.sequence} 步（${last.position}）的读数 ${last.torque} cN·m。`;
+    }
+  }
+  render();
+}
+
+/**
+ * 撤回上一步：二次确认后调用撤回接口。成功后以服务端权威进度回到上一颗，
+ * 扭矩输入原样保留，操作工仍从原确认入口以新读数重新提交（新幂等键）。
+ * 失败（无可撤回记录/已完成/被并发撤回先得手）时展示明确原因、
+ * 重新对齐最新权威进度，且不清除当前输入。
+ */
+async function retractLast() {
+  if (state.retracting || !state.view || state.view.status !== 'in_progress') return;
+  const last = lastActiveConfirmation();
+  if (!last) return;
+
+  clearMessages();
+  state.retracting = true;
+  render();
+  try {
+    const { status, body } = await fetchJson(
+      `/sessions/${state.sessionId}/confirmations/last/retract`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirmation_id: last.id }),
+      },
+    );
+    if (status === 200) {
+      state.retractFormOpen = false;
+      await refresh();
+      showNotice(
+        `已撤回第 ${body.retraction.sequence} 步（${body.retraction.position}），` +
+        '请重新录入正确扭矩并确认',
+      );
+    } else {
+      // 确定性失败：不重试，展示明确原因并以最新权威进度对齐（不清除当前输入）
+      const message = (body && body.error && body.error.message) || `HTTP ${status}`;
+      state.retractFormOpen = false;
+      showError(`撤回失败：${message}`);
+      await refresh();
+    }
+  } catch {
+    // 网络异常：结果未知，不断言撤回成败，重新拉取权威进度对齐，输入保留
+    state.retractFormOpen = false;
+    showError('网络异常，撤回请求结果未知；已重新读取进度，请核对后再操作');
+    await refresh();
+  } finally {
+    state.retracting = false;
+    render();
+  }
+}
+
 function render() {
   const view = state.view;
   $('session-id').textContent = state.sessionId ? state.sessionId.slice(0, 8) : '—';
@@ -439,11 +516,19 @@ function render() {
   }
 
   const inProgress = Boolean(view) && view.status === 'in_progress';
-  $('work-panel').hidden = !inProgress || state.cancelFormOpen;
+  // 撤回或终止的二次确认面板打开时，收起扭矩录入面板
+  $('work-panel').hidden = !inProgress || state.cancelFormOpen || state.retractFormOpen;
   if (inProgress) {
     $('current-position').textContent = view.expected_position;
     $('current-seq').textContent = String(view.expected_sequence);
   }
+
+  // 「撤回上一步」仅在已有确认且尚未完成（进行中）时出现
+  const canRetract = inProgress && view.confirmed_count > 0;
+  $('btn-retract-open').hidden = !canRetract;
+
+  // 撤回二次确认面板仅在进行中、且确有可撤回记录时显示
+  $('retract-panel').hidden = !inProgress || !state.retractFormOpen || !canRetract;
 
   // 终止原因填写面板仅在进行中会话上可打开
   $('cancel-panel').hidden = !inProgress || !state.cancelFormOpen;
@@ -481,18 +566,50 @@ function render() {
     }
   }
 
+  // 撤回审计：进行中与终态都保留痕迹；被撤回的原读数不进入有效确认列表
+  const retractions = (view && view.retractions) || [];
+  $('retractions-panel').hidden = !(view && retractions.length > 0);
+  if (view && retractions.length > 0) {
+    const rtbody = $('retractions-table').querySelector('tbody');
+    rtbody.textContent = '';
+    for (const r of retractions) {
+      const tr = document.createElement('tr');
+      const reading = r.torque_unit === 'N·m'
+        ? `${r.torque_input} N·m（${r.torque} cN·m）`
+        : `${r.torque} cN·m`;
+      for (const text of [
+        r.sequence,
+        r.position,
+        reading,
+        new Date(r.confirmed_at).toLocaleString('zh-CN', { hour12: false }),
+        new Date(r.retracted_at).toLocaleString('zh-CN', { hour12: false }),
+      ]) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      rtbody.appendChild(tr);
+    }
+  }
+
   $('btn-submit').disabled = state.busy || !inProgress;
   $('torque-input').disabled = state.busy || !inProgress;
-  $('btn-cancel-open').disabled = state.busy || state.cancelling || state.opening || !inProgress;
-  $('btn-refresh').disabled = state.busy || state.cancelling || state.opening;
+  $('btn-retract-open').disabled =
+    state.busy || state.retracting || state.cancelling || state.opening || !inProgress;
+  $('btn-cancel-open').disabled =
+    state.busy || state.retracting || state.cancelling || state.opening || !inProgress;
+  $('btn-refresh').disabled = state.busy || state.retracting || state.cancelling || state.opening;
+  $('btn-retract-confirm').disabled = state.retracting;
+  $('btn-retract-back').disabled = state.retracting;
   $('btn-cancel-confirm').disabled = state.cancelling;
   $('btn-cancel-back').disabled = state.cancelling;
-  $('btn-switch').disabled = state.busy || state.cancelling || state.opening;
+  $('btn-switch').disabled = state.busy || state.retracting || state.cancelling || state.opening;
   $('btn-open').disabled = state.busy || state.opening;
   $('btn-new').disabled = state.busy || state.opening;
   $('workorder-input').disabled = state.busy || state.opening;
   document.querySelectorAll('input[name="unit"]').forEach((radio) => {
-    radio.disabled = state.busy || state.cancelling || state.opening || !inProgress;
+    radio.disabled =
+      state.busy || state.retracting || state.cancelling || state.opening || !inProgress;
   });
 }
 
@@ -563,6 +680,9 @@ window.addEventListener('DOMContentLoaded', () => {
   $('btn-cancel-open').addEventListener('click', () => setCancelForm(true));
   $('btn-cancel-back').addEventListener('click', () => setCancelForm(false));
   $('btn-cancel-confirm').addEventListener('click', cancelSession);
+  $('btn-retract-open').addEventListener('click', () => setRetractForm(true));
+  $('btn-retract-back').addEventListener('click', () => setRetractForm(false));
+  $('btn-retract-confirm').addEventListener('click', retractLast);
   $('cancel-reason').addEventListener('input', () => {
     const len = cancelReasonLength();
     $('cancel-reason-hint').textContent =
