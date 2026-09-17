@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>轮毂复核工位</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<main class="panel">
+  <header class="topbar">
+    <h1>轮毂复核工位</h1>
+    <div class="session-bar">
+      <span>工单码：<code id="workorder-code">—</code></span>
+      <span>会话：<code id="session-id">—</code></span>
+      <span id="progress-text"></span>
+      <button id="btn-switch" type="button">打开其他工单</button>
+      <button id="btn-refresh" type="button">刷新进度</button>
+    </div>
+  </header>
+
+  <section id="entry-panel" class="entry">
+    <h2>按工单码进入复核</h2>
+    <p class="hint">输入或扫描轮毂工单码后打开复核；换班、换触屏或清理浏览器后，输入同一工单码即可接续原进度。</p>
+    <label class="field">
+      工单码
+      <input id="workorder-input" type="text" autocomplete="off"
+             inputmode="text" placeholder="输入或扫码工单码">
+    </label>
+    <div class="entry-actions">
+      <button id="btn-open" type="button">打开复核</button>
+      <span class="entry-alt">或</span>
+      <button id="btn-new" type="button">开始无码新会话</button>
+    </div>
+  </section>
+
+  <ol id="bolt-list" class="bolts"></ol>
+
+  <section id="work-panel" class="work" hidden>
+    <p class="current">
+      当前螺栓：<strong id="current-position" class="position"></strong>
+      <span class="step">（第 <span id="current-seq"></span> / 6 步）</span>
+    </p>
+    <fieldset class="units" aria-label="录入单位">
+      <legend>录入单位</legend>
+      <label><input type="radio" name="unit" value="cN·m" checked> cN·m（工位默认，整数）</label>
+      <label><input type="radio" name="unit" value="N·m"> N·m（数显扳手，最多两位小数）</label>
+    </fieldset>
+    <label class="field">
+      <span id="torque-label">扭矩（cN·m，合格范围 4200–4800，含边界）</span>
+      <input id="torque-input" type="number" step="1" min="4200" max="4800"
+             inputmode="numeric" autocomplete="off" placeholder="例如 4500">
+    </label>
+    <button id="btn-submit" type="button">确认复核</button>
+    <button id="btn-cancel-open" class="btn-danger-outline" type="button">终止复核</button>
+  </section>
+
+  <section id="cancel-panel" class="cancel-panel" hidden>
+    <h2>终止复核</h2>
+    <p class="hint">终止后该会话不可再提交扭矩确认，请填写原因（2–100 字），例如「轮毂拆下返修」「装夹错误」。</p>
+    <label class="field">
+      终止原因
+      <textarea id="cancel-reason" rows="3" maxlength="100"
+                placeholder="请说明终止原因（2–100 字）"></textarea>
+    </label>
+    <p id="cancel-reason-hint" class="hint"></p>
+    <div class="cancel-actions">
+      <button id="btn-cancel-confirm" class="btn-danger" type="button">确认终止</button>
+      <button id="btn-cancel-back" type="button">返回继续复核</button>
+    </div>
+  </section>
+
+  <p id="notice" class="notice" role="status"></p>
+  <p id="error" class="error" role="alert"></p>
+
+  <section id="cancelled-banner" class="cancelled" hidden>
+    <h2>该会话已终止复核</h2>
+    <p>终止时间：<strong id="cancelled-at"></strong></p>
+    <p>终止原因：<strong id="cancelled-reason"></strong></p>
+    <p class="hint">扭矩提交已关闭，如需继续请点击「开始新会话」。</p>
+  </section>
+
+  <section id="done-banner" class="done" hidden>
+    <h2>轮毂复核完成</h2>
+    <table id="confirm-table">
+      <thead>
+        <tr><th>序号</th><th>位置</th><th>扭矩 (cN·m)</th><th>确认时间</th><th>幂等键</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

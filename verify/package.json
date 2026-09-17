@@ -1,0 +1,14 @@
+{
+  "name": "hub-review-verify",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "轮毂复核工位一次性验收：协议用例 + 真实浏览器操作用例",
+  "scripts": {
+    "start": "node src/run.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "playwright": "1.47.2"
+  }
+}

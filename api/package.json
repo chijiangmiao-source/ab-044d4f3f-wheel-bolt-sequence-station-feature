@@ -1,0 +1,15 @@
+{
+  "name": "hub-review-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "轮毂复核工位 API：会话与不可变确认事件",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
+  }
+}
