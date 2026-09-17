@@ -55,6 +55,13 @@ export async function runBrowser(webBase, apiBase, t) {
     return (await page.textContent('#current-position')).trim();
   }
 
+  // 撤回当前最后一步：打开二次确认面板并确认
+  async function retractLastViaUi(page) {
+    await page.click('#btn-retract-open');
+    await page.waitForSelector('#retract-panel:not([hidden])');
+    await page.click('#btn-retract-confirm');
+  }
+
   async function serverState(page) {
     const sessionId = await page.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
     assert(sessionId, '页面应已保存会话编号');
@@ -475,6 +482,125 @@ export async function runBrowser(webBase, apiBase, t) {
       assertEqual(st.status, 'cancelled', '服务端保持已终止');
       assertEqual(st.confirmations.length, 2, '确认不推进、不写事件');
       await page.close();
+    });
+
+    await t.test('页面完成两步后撤回第二步、以新扭矩重做并完成，刷新后只显示有效记录与审计', async () => {
+      const page = await newSessionPage();
+      await confirmCurrent(page, 4500);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      await confirmCurrent(page, 4600);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+      assertEqual(await page.locator('#bolt-list li.done').count(), 2, '已完成两颗');
+
+      // 撤回入口仅在已有确认且未完成时出现；初始/完成态均不可见
+      assert(await page.isVisible('#btn-retract-open'), '进行中且有确认时显示撤回按钮');
+
+      // 二次确认面板：取消不撤回
+      await page.click('#btn-retract-open');
+      await page.waitForSelector('#retract-panel:not([hidden])');
+      assert(
+        (await page.textContent('#retract-summary')).includes('B2'),
+        '二次确认应说明将撤回 B2',
+      );
+      await page.click('#btn-retract-back');
+      await page.waitForSelector('#retract-panel', { state: 'hidden' });
+      assertEqual(await currentPosition(page), 'A3', '取消撤回后仍在 A3');
+
+      // 二次确认后真正撤回
+      await retractLastViaUi(page);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      const notice = await page.textContent('#notice');
+      assert(notice.includes('已撤回第 2 步'), `应提示已撤回：${notice}`);
+      assertEqual(await page.locator('#bolt-list li.done').count(), 1, '撤回后只剩一颗完成');
+      assert(await page.isVisible('#retractions-panel'), '应展示撤回记录面板');
+      const audit = await page.textContent('#retractions-panel');
+      assert(audit.includes('4600 cN·m'), '审计保留被撤回的旧读数');
+      assert(audit.includes('B2'), '审计记录位置 B2');
+
+      // 以新扭矩重做第二步并完成全流程
+      await confirmCurrent(page, 4700);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A3',
+      );
+      for (let i = 2; i < 6; i += 1) {
+        await page.waitForFunction(
+          (pos) => document.getElementById('current-position').textContent.trim() === pos,
+          POSITIONS[i],
+        );
+        await confirmCurrent(page, 4500);
+      }
+      await page.waitForSelector('#done-banner:not([hidden])');
+      const rows = page.locator('#confirm-table tbody tr');
+      assertEqual(await rows.count(), 6, '完成表列出六条有效确认');
+      assertEqual(
+        (await rows.nth(1).locator('td').nth(2).textContent()).trim(),
+        '4700',
+        '第二步为重做后的新读数',
+      );
+      // 完成态不再显示撤回入口，但审计痕迹保留
+      assert(await page.isHidden('#btn-retract-open'), '完成态不显示撤回按钮');
+      const auditAfter = await page.textContent('#retractions-panel');
+      assert(auditAfter.includes('4600 cN·m'), '完成态仍保留撤回审计');
+
+      // 刷新后只显示重做后的有效记录，审计仍在
+      await page.reload();
+      await page.waitForSelector('#done-banner:not([hidden])');
+      const rows2 = page.locator('#confirm-table tbody tr');
+      assertEqual(await rows2.count(), 6, '刷新后仍为六条有效确认');
+      const auditAfterRefresh = await page.textContent('#retractions-panel');
+      assert(auditAfterRefresh.includes('4600 cN·m'), '刷新后审计保留');
+      const st = await serverState(page);
+      assertEqual(st.status, 'completed', '服务端完成态');
+      assertEqual(st.confirmations.length, 6, '服务端只计有效确认');
+      assertEqual(st.confirmations[1].torque, 4700, '服务端第二步为新读数');
+      assertEqual(st.retractions.length, 1, '服务端保留一条撤回审计');
+      assertEqual(st.retractions[0].torque, 4600, '服务端审计为旧读数');
+      await closePage(page);
+    });
+
+    await t.test('撤回失败时保留最新权威进度且不清除当前输入', async () => {
+      const page = await newSessionPage();
+      // 初始没有确认：撤回按钮不显示（无入口可点）
+      assert(await page.isHidden('#btn-retract-open'), '没有确认时不显示撤回按钮');
+      await confirmCurrent(page, 4500);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      // 另一个客户端（并发请求）先撤回了唯一一条确认；页面视图尚未刷新，按钮仍在。
+      // 先在输入框填写读数，失败后该输入必须保留。
+      await page.fill('#torque-input', '4700');
+      const sid = await page.evaluate((k) => localStorage.getItem(k), 'hub_review.session_id');
+      const raced = await fetch(`${apiBase}/api/sessions/${sid}/confirmations/last/retract`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid, sequence: 1 }),
+      });
+      assertEqual(raced.status, 200, '并发的第一个撤回成功');
+      // 页面再点撤回：服务端已无可撤回记录
+      await retractLastViaUi(page);
+      await page.waitForFunction(
+        () => document.getElementById('error').textContent.includes('撤回失败'),
+      );
+      const err = await page.textContent('#error');
+      assert(err.includes('没有可撤回的确认'), `原因应明确：${err}`);
+      // 失败后页面以服务端权威进度对齐（错误先于 refresh 完成展示，需等待权威态到达）
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'A1',
+      );
+      assertEqual((await page.inputValue('#torque-input')).trim(), '4700', '当前输入不被清除');
+      assert(await page.isHidden('#btn-retract-open'), '无有效确认后撤回入口消失');
+      // 权威进度上仍可立即重新确认
+      await confirmCurrent(page, 4700);
+      await page.waitForFunction(
+        () => document.getElementById('current-position').textContent.trim() === 'B2',
+      );
+      await closePage(page);
     });
 
     await t.test('旧客户端只使用原三个接口：新建会话后按原六步完成', async () => {

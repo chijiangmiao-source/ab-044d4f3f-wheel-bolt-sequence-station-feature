@@ -52,7 +52,18 @@
              inputmode="numeric" autocomplete="off" placeholder="例如 4500">
     </label>
     <button id="btn-submit" type="button">确认复核</button>
+    <button id="btn-retract-open" class="btn-warning-outline" type="button">撤回上一步</button>
     <button id="btn-cancel-open" class="btn-danger-outline" type="button">终止复核</button>
+  </section>
+
+  <section id="retract-panel" class="retract-panel" hidden>
+    <h2>撤回上一步确认</h2>
+    <p class="hint" id="retract-summary"></p>
+    <p class="hint">撤回后该读数将不计入复核，本颗螺栓回到待复核状态，可立即在原入口录入正确读数并重新确认；撤回记录会保留审计痕迹。</p>
+    <div class="retract-actions">
+      <button id="btn-retract-confirm" class="btn-warning" type="button">确认撤回</button>
+      <button id="btn-retract-back" type="button">返回继续复核</button>
+    </div>
   </section>
 
   <section id="cancel-panel" class="cancel-panel" hidden>
@@ -72,6 +83,17 @@
 
   <p id="notice" class="notice" role="status"></p>
   <p id="error" class="error" role="alert"></p>
+
+  <section id="retractions-panel" class="retractions" hidden>
+    <h2>撤回记录</h2>
+    <p class="hint">撤回为不可变审计事件：被撤回的读数不计入复核，但记录完整保留。</p>
+    <table id="retractions-table">
+      <thead>
+        <tr><th>序号</th><th>位置</th><th>原读数</th><th>撤回时间</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
 
   <section id="cancelled-banner" class="cancelled" hidden>
     <h2>该会话已终止复核</h2>

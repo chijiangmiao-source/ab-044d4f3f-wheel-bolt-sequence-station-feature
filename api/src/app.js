@@ -73,6 +73,57 @@ function confirmationView(row) {
   };
 }
 
+/**
+ * 撤回审计视图：合并撤回事件与其指向的（不可变）原确认记录。
+ * confirmations 中不再计入该记录，但完整审计痕迹由此返回。
+ */
+function retractionView(row) {
+  return {
+    id: Number(row.id),
+    confirmation_id: Number(row.confirmation_id),
+    sequence: row.sequence,
+    position: row.position,
+    torque: row.torque,
+    torque_input: row.torque_input,
+    torque_unit: row.torque_unit,
+    idempotency_key: row.idempotency_key,
+    confirmed_at: row.confirmed_at,
+    retracted_at: row.retracted_at,
+  };
+}
+
+/** 有效确认：不存在对应撤回事件的确认。查询一律 ORDER BY sequence。 */
+const EFFECTIVE_CONFIRMATIONS_SQL = `
+  SELECT c.*
+  FROM confirmations c
+  WHERE c.session_id = $1
+    AND NOT EXISTS (
+      SELECT 1 FROM confirmation_retractions r
+      WHERE r.confirmation_id = c.id
+    )
+  ORDER BY c.sequence
+`;
+
+/** 撤回审计：撤回事件 JOIN 原确认（只增不改的两张事件表），按撤回先后排序。 */
+const RETRACTIONS_SQL = `
+  SELECT r.id, r.confirmation_id, r.sequence, r.retracted_at,
+         c.position, c.torque, c.torque_input, c.torque_unit,
+         c.idempotency_key, c.confirmed_at
+  FROM confirmation_retractions r
+  JOIN confirmations c ON c.id = r.confirmation_id
+  WHERE r.session_id = $1
+  ORDER BY r.id
+`;
+
+/** 读取会话视图所需的有效确认与撤回审计（使用任意查询客户端/连接）。 */
+async function loadSessionDetails(client, sessionId) {
+  const [confirmations, retractions] = await Promise.all([
+    client.query(EFFECTIVE_CONFIRMATIONS_SQL, [sessionId]),
+    client.query(RETRACTIONS_SQL, [sessionId]),
+  ]);
+  return { confirmations: confirmations.rows, retractions: retractions.rows };
+}
+
 /** 由会话行推导的权威进度。 */
 function progressOf(session) {
   const finished = session.status !== 'in_progress';
@@ -90,7 +141,7 @@ function progressOf(session) {
   return progress;
 }
 
-function sessionView(session, confirmations) {
+function sessionView(session, confirmations, retractions = []) {
   return {
     session_id: session.id,
     work_order_code: session.work_order_code ?? null,
@@ -101,7 +152,10 @@ function sessionView(session, confirmations) {
     default_unit: DEFAULT_UNIT,
     nm_max_decimals: NM_MAX_DECIMALS,
     ...progressOf(session),
+    // 只包含未撤回的有效确认；旧客户端不读取该字段之外的新增字段，协议保持不变
     confirmations: confirmations.map(confirmationView),
+    // 撤回审计痕迹（追加字段，旧客户端忽略即可）
+    retractions: retractions.map(retractionView),
   };
 }
 
@@ -283,12 +337,11 @@ export function createApp() {
     try {
       await client.query('BEGIN');
       const { created, session } = await openWorkOrderSession(client, code);
-      const c = await client.query(
-        'SELECT * FROM confirmations WHERE session_id = $1 ORDER BY sequence',
-        [session.id],
-      );
+      const details = await loadSessionDetails(client, session.id);
       await client.query('COMMIT');
-      res.status(created ? 201 : 200).json(sessionView(session, c.rows));
+      res
+        .status(created ? 201 : 200)
+        .json(sessionView(session, details.confirmations, details.retractions));
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       next(err);
@@ -308,11 +361,10 @@ export function createApp() {
       if (s.rowCount === 0) {
         throw new ApiError(404, 'session_not_found', '会话不存在');
       }
-      const c = await pool.query(
-        'SELECT * FROM confirmations WHERE session_id = $1 ORDER BY sequence',
-        [id],
+      const details = await loadSessionDetails(pool, id);
+      res.json(
+        sessionView(s.rows[0], details.confirmations, details.retractions),
       );
-      res.json(sessionView(s.rows[0], c.rows));
     } catch (err) {
       next(err);
     }
@@ -375,6 +427,139 @@ export function createApp() {
       );
       await client.query('COMMIT');
       res.json({ cancelled: true, replayed: false, progress: progressOf(upd.rows[0]) });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      next(err);
+    } finally {
+      client.release();
+    }
+  });
+
+  /**
+   * 撤回上一步（POST /api/sessions/:id/confirmations/last/retract）。
+   *
+   * 在锁定会话的事务内：
+   * 1. 找到当前最后一条「有效确认」（未被撤回的）；
+   * 2. 追加一条不可变撤回事件 confirmation_retractions（原确认行绝不修改/删除）；
+   * 3. 把期待序号回退到被撤回步骤，随后仍从原确认入口按该序号重新提交。
+   *
+   * 请求体可选携带 sequence：客户端发起撤回时看到的最后确认序号，作为乐观令牌，
+   * 让并发的两个撤回请求在同一把会话行锁上分出唯一赢家——后到者发现当前最后
+   * 有效确认序号已变化，返回 409 retraction_conflict 而不是再撤回一颗。
+   * 任何失败都返回最新权威进度，且不追加事件、不回退序号。
+   */
+  app.post('/api/sessions/:id/confirmations/last/retract', async (req, res, next) => {
+    const client = await pool.connect();
+    try {
+      const { id } = req.params;
+      if (!UUID_RE.test(id)) {
+        throw new ApiError(404, 'session_not_found', '会话不存在');
+      }
+      const body = req.body ?? {};
+      if (body.session_id !== undefined && body.session_id !== id) {
+        throw new ApiError(400, 'invalid_body', '会话编号与请求路径不一致');
+      }
+      let clientSequence;
+      if (body.sequence !== undefined) {
+        if (!Number.isInteger(body.sequence) || body.sequence < 1) {
+          throw new ApiError(400, 'invalid_body', 'sequence 必须为从 1 开始的整数序号');
+        }
+        clientSequence = body.sequence;
+      }
+
+      await client.query('BEGIN');
+      // 与确认/终止同一把会话行锁：撤回与提交、终止、撤回之间全部串行化
+      const sres = await client.query(
+        'SELECT * FROM sessions WHERE id = $1 FOR UPDATE',
+        [id],
+      );
+      if (sres.rowCount === 0) {
+        throw new ApiError(404, 'session_not_found', '会话不存在');
+      }
+      const session = sres.rows[0];
+      if (session.status === 'completed') {
+        throw new ApiError(
+          409,
+          'session_completed',
+          '会话已完成，不可撤回确认',
+          { progress: progressOf(session) },
+        );
+      }
+      if (session.status === 'cancelled') {
+        throw new ApiError(
+          409,
+          'session_cancelled',
+          '会话已终止复核，不可撤回确认',
+          { progress: progressOf(session) },
+        );
+      }
+
+      const lastRes = await client.query(
+        `SELECT c.*
+         FROM confirmations c
+         WHERE c.session_id = $1
+           AND NOT EXISTS (
+             SELECT 1 FROM confirmation_retractions r
+             WHERE r.confirmation_id = c.id
+           )
+         ORDER BY c.sequence DESC
+         LIMIT 1`,
+        [id],
+      );
+      if (lastRes.rowCount === 0) {
+        throw new ApiError(
+          409,
+          'nothing_to_retract',
+          '当前没有可撤回的确认',
+          { progress: progressOf(session) },
+        );
+      }
+      const lastConfirmation = lastRes.rows[0];
+      if (clientSequence !== undefined && clientSequence !== lastConfirmation.sequence) {
+        // 会话行锁上已看到更新的权威状态（通常是并发撤回先生效）：
+        // 不追加事件、不再回退，要求客户端以最新进度为准
+        throw new ApiError(
+          409,
+          'retraction_conflict',
+          `第 ${clientSequence} 步已被撤回或进度已变化，请勿重复撤回，请以最新进度为准`,
+          { progress: progressOf(session) },
+        );
+      }
+
+      // 追加不可变撤回事件；原确认事件一行不动
+      const rres = await client.query(
+        `INSERT INTO confirmation_retractions (session_id, confirmation_id, sequence)
+         VALUES ($1, $2, $3) RETURNING *`,
+        [id, lastConfirmation.id, lastConfirmation.sequence],
+      );
+      // 期待序号回退到被撤回的步骤：撤回第 k 步后重新期待第 k 步
+      const upd = await client.query(
+        `UPDATE sessions
+         SET expected_sequence = $1, updated_at = now()
+         WHERE id = $2 RETURNING *`,
+        [lastConfirmation.sequence, id],
+      );
+      const details = await loadSessionDetails(client, id);
+      const updatedSession = upd.rows[0];
+      await client.query('COMMIT');
+
+      const retractionRow = {
+        ...rres.rows[0],
+        position: lastConfirmation.position,
+        torque: lastConfirmation.torque,
+        torque_input: lastConfirmation.torque_input,
+        torque_unit: lastConfirmation.torque_unit,
+        idempotency_key: lastConfirmation.idempotency_key,
+        confirmed_at: lastConfirmation.confirmed_at,
+      };
+      res.json({
+        retracted: true,
+        retraction: retractionView(retractionRow),
+        progress: progressOf(updatedSession),
+        // 同时给出权威的有效确认与审计列表，客户端可直接采用，无需再次拉取
+        confirmations: details.confirmations.map(confirmationView),
+        retractions: details.retractions.map(retractionView),
+      });
     } catch (err) {
       await client.query('ROLLBACK').catch(() => {});
       next(err);

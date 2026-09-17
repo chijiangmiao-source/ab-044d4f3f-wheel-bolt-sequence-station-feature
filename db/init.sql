@@ -6,7 +6,8 @@ CREATE TABLE sessions (
   -- in_progress 进行中；completed 六步全部完成；cancelled 操作工带原因终止（拆下返修/装夹错误）
   status            TEXT NOT NULL DEFAULT 'in_progress'
                     CHECK (status IN ('in_progress', 'completed', 'cancelled')),
-  -- 下一个期待的序号（从 1 开始）；六步全部确认后为 7，仅服务端可推进
+  -- 下一个期待的序号（从 1 开始）；六步全部确认后为 7，仅服务端可推进；
+  -- 撤回上一步时在同一事务内向回回退（如 3 → 2）
   expected_sequence INTEGER NOT NULL DEFAULT 1
                     CHECK (expected_sequence BETWEEN 1 AND 7),
   -- 可选工单码：非空值全表唯一（NULL 互不冲突，历史无码会话无需补值）。
@@ -40,22 +41,83 @@ CREATE TABLE confirmations (
   torque_unit     TEXT NOT NULL CHECK (torque_unit IN ('cN·m', 'N·m')),
   idempotency_key TEXT NOT NULL,
   confirmed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  -- 同一会话内：每个序号至多一条确认；每个幂等键至多绑定一条确认
-  UNIQUE (session_id, sequence),
+  -- 同一会话内每个幂等键永远只绑定这一条提交事件：撤回不改绑、不删除，
+  -- 因此既有幂等键语义（同键同载荷返回原确认、同键异载荷冲突）原样成立。
   UNIQUE (session_id, idempotency_key)
+  -- 注意：这里不再对 (session_id, sequence) 建普通唯一约束。
+  -- 撤回是「只增不改」的：旧确认行原样保留并由 confirmation_retractions 标记失效，
+  -- 同一序号随后允许重新确认（产生新的一行）；任一时刻最多一条有效记录由
+  -- 触发器 confirmations_effective_single 在数据库层兜底，业务写入另由会话行锁串行化。
 );
 
--- 确认事件不可变：数据库层拒绝任何 UPDATE / DELETE
-CREATE OR REPLACE FUNCTION confirmations_immutable() RETURNS trigger AS $$
+-- 撤回事件（审计日志）：每次撤回追加一行，永不修改、永不删除。
+-- 确认事件本身不做任何 UPDATE：是否有效完全由「是否存在对应撤回事件」派生。
+CREATE TABLE confirmation_retractions (
+  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  session_id      UUID NOT NULL REFERENCES sessions (id),
+  confirmation_id BIGINT NOT NULL REFERENCES confirmations (id),
+  -- 冗余序号，便于审计直接阅读，与 confirmations.sequence 一致
+  sequence        INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 6),
+  retracted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- 一条确认至多被撤回一次（撤回后重新确认产生的是新确认行）
+  UNIQUE (confirmation_id)
+);
+
+CREATE INDEX confirmation_retractions_session_idx
+  ON confirmation_retractions (session_id);
+
+-- 数据库约束：同一 (session_id, sequence) 任一时刻最多一条「有效确认」，
+-- 有效确认 = 不存在对应撤回事件的确认。
+-- 撤回后旧行仍在（已失效），因此同一序号可以再次插入新的有效确认。
+-- 触发器先取按 (session_id, sequence) 派生的事务级咨询锁再做存在性检查：
+-- 即使有绕过应用会话行锁的并发写入，也会在此串行化，第二个事务在锁上
+-- 等到第一个提交后能看到其新行并抛出唯一冲突，从而构成硬约束。
+CREATE OR REPLACE FUNCTION confirmations_effective_single() RETURNS trigger AS $$
 BEGIN
-  RAISE EXCEPTION 'confirmations 为不可变事件表，禁止 %', TG_OP;
+  PERFORM pg_advisory_xact_lock(
+    hashtextextended(NEW.session_id::text || ':' || NEW.sequence, 48271)
+  );
+  IF EXISTS (
+    SELECT 1
+    FROM confirmations c
+    WHERE c.session_id = NEW.session_id
+      AND c.sequence = NEW.sequence
+      AND c.id IS DISTINCT FROM NEW.id
+      AND NOT EXISTS (
+        SELECT 1 FROM confirmation_retractions r
+        WHERE r.confirmation_id = c.id
+      )
+  ) THEN
+    RAISE EXCEPTION '会话 % 的序号 % 已存在有效确认，不能重复落库', NEW.session_id, NEW.sequence
+      USING ERRCODE = 'unique_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER confirmations_effective_single_trg
+  BEFORE INSERT ON confirmations
+  FOR EACH ROW EXECUTE FUNCTION confirmations_effective_single();
+
+-- 事件表不可变：数据库层拒绝任何 UPDATE / DELETE（确认事件与撤回事件均适用）
+CREATE OR REPLACE FUNCTION events_immutable() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION '% 为不可变事件表，禁止 %', TG_TABLE_NAME, TG_OP;
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER confirmations_no_update
   BEFORE UPDATE ON confirmations
-  FOR EACH ROW EXECUTE FUNCTION confirmations_immutable();
+  FOR EACH ROW EXECUTE FUNCTION events_immutable();
 
 CREATE TRIGGER confirmations_no_delete
   BEFORE DELETE ON confirmations
-  FOR EACH ROW EXECUTE FUNCTION confirmations_immutable();
+  FOR EACH ROW EXECUTE FUNCTION events_immutable();
+
+CREATE TRIGGER confirmation_retractions_no_update
+  BEFORE UPDATE ON confirmation_retractions
+  FOR EACH ROW EXECUTE FUNCTION events_immutable();
+
+CREATE TRIGGER confirmation_retractions_no_delete
+  BEFORE DELETE ON confirmation_retractions
+  FOR EACH ROW EXECUTE FUNCTION events_immutable();
